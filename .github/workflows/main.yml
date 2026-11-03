@@ -49,6 +49,7 @@ jobs:
 
     - name: Build
       run: |
+         git clone https://github.com/fliporlean/xray-core xray-core && git -C xray-core checkout 9bcf269d4af6
          mkdir -p assets data
          bash gen_assets.sh download
          cp -v data/*.dat assets/
