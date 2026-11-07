@@ -14,7 +14,11 @@ package libv2ray
 //   2. builds the final Xray JSON from the decrypted config IN GO (today: a
 //      whole Xray config, "adopted" by adding the module's SOCKS inbound; the
 //      share-link / single-outbound forms are reserved for phase 2 below);
-//   3. hands the result to the SAME doStartLoop the normal StartLoop uses.
+//   3. when an uplink port is given, rewrites that config IN GO so every
+//      outbound dials through the service's protected loopback SOCKS proxy
+//      (XrayConfigFactory.withUplink, ported faithfully below) - so the whole
+//      anti-leak arrangement happens without the plaintext config touching Java;
+//   4. hands the result to the SAME doStartLoop the normal StartLoop uses.
 //
 // Nothing here modifies StartLoop or any existing file. It is purely additive.
 //
@@ -33,9 +37,6 @@ package libv2ray
 typedef const char* (*nway_dec_fn)(const char*, const char*, const char*);
 
 static const char* nway_bridge_decrypt(const char* enc, const char* dir, const char* uuid) {
-    // RTLD_NOLOAD first: the lib is already in the process, so this just grabs
-    // a handle without reloading. Fall back to a normal dlopen if, for any
-    // reason, it is not loaded yet.
     void* h = dlopen("libEncryption.so", RTLD_NOW | RTLD_NOLOAD);
     if (h == 0) {
         h = dlopen("libEncryption.so", RTLD_NOW);
@@ -62,24 +63,29 @@ import (
 	"unsafe"
 )
 
-// XRAY_SOCKS_PORT in the module. The inbound tun2socks dials. Keep in sync with
-// AlfaSettings.XRAY_SOCKS_PORT on the Java side.
-const nwaySocksPort = 10808
-const nwayLoopback = "127.0.0.1"
-const nwaySocksInTag = "socks-in"
+// Keep in sync with the Java side.
+const nwaySocksPort = 10808       // AlfaSettings.XRAY_SOCKS_PORT
+const nwayLoopback = "127.0.0.1"  // AlfaSettings.LOOPBACK
+const nwaySocksInTag = "socks-in" // XrayConfigFactory.TAG_SOCKS_IN
+const nwayTagUplink = "uplink"    // XrayConfigFactory.TAG_UPLINK
+const nwayMaxChain = 16           // XrayConfigFactory.MAX_CHAIN
 
 // StartLoopSecure is the encrypted twin of StartLoop.
 //
 //	encConfig   the GCM envelope exactly as the server sent it (base64)
 //	filesDir    context.getFilesDir().getAbsolutePath()  (NOT secret)
 //	uuid        ANDROID_ID                                (NOT secret)
-//	enableStats whether to inject the traffic-stats policy (mirrors
-//	            V2rayConfigModel.enableTrafficStatics)
+//	enableStats whether to inject the traffic-stats policy
+//	uplinkPort  the service's live AlfaUplink loopback port, or <=0 for none.
+//	            When > 0, every outbound is pointed at it (anti-leak) IN GO;
+//	            if that rewrite cannot be done the start is refused rather than
+//	            run unprotected - the plaintext config never reaches Java either
+//	            way.
 //	tunFd       0 here, same as StartLoop (tun2socks feeds the core over SOCKS)
 //
 // The plaintext config lives only inside this Go call; it is never returned to
 // Java and `ak` is never seen outside libEncryption.
-func (x *CoreController) StartLoopSecure(encConfig string, filesDir string, uuid string, enableStats bool, tunFd int32) error {
+func (x *CoreController) StartLoopSecure(encConfig string, filesDir string, uuid string, enableStats bool, uplinkPort int32, tunFd int32) error {
 	plain := nwayDecrypt(encConfig, filesDir, uuid)
 	if plain == "" {
 		return errors.New("nway: decrypt failed")
@@ -88,6 +94,17 @@ func (x *CoreController) StartLoopSecure(encConfig string, filesDir string, uuid
 	full, err := nwayBuildAuto(plain, enableStats)
 	if err != nil {
 		return fmt.Errorf("nway: build failed: %w", err)
+	}
+
+	if uplinkPort > 0 {
+		rewritten, applied := nwayWithUplink(full, int(uplinkPort))
+		if !applied {
+			// The uplink could not be made to carry the transport. Refuse
+			// rather than run with the egress unprotected - same choice the
+			// service makes, kept here so the plaintext never leaves native.
+			return errors.New("nway: uplink could not be applied")
+		}
+		full = rewritten
 	}
 
 	// Same lifecycle as StartLoop, so behaviour past this point is identical.
@@ -117,7 +134,7 @@ func nwayDecrypt(enc, dir, uuid string) string {
 	if res == nil {
 		return ""
 	}
-	defer C.free(unsafe.Pointer(res)) // malloc'd by the C++ side; free with libc free
+	defer C.free(unsafe.Pointer(res))
 	return C.GoString(res)
 }
 
@@ -145,7 +162,6 @@ func nwayBuildAuto(raw string, enableStats bool) (string, error) {
 		return "", fmt.Errorf("bad json: %w", err)
 	}
 	if _, ok := cfg["outbounds"]; !ok {
-		// An object that is a single outbound, not a whole config: phase 2.
 		return "", errors.New("single-outbound form not supported yet (phase 2)")
 	}
 
@@ -163,9 +179,6 @@ func nwayBuildAuto(raw string, enableStats bool) (string, error) {
 
 // nwayAdopt mirrors XrayConfigFactory.adopt(): leave the whole config as pasted
 // and guarantee a reachable SOCKS inbound on XRAY_SOCKS_PORT for tun2socks.
-//   - a socks/mixed inbound already on that port  -> reuse it (listen+udp)
-//   - a non-socks inbound on that port            -> refuse (don't silently break it)
-//   - none                                        -> add one
 func nwayAdopt(cfg map[string]interface{}) error {
 	inbounds, _ := cfg["inbounds"].([]interface{})
 	if inbounds == nil {
@@ -258,4 +271,299 @@ func nwayInt(v interface{}, def int) int {
 		}
 	}
 	return def
+}
+
+// =============================================================================
+// withUplink: XrayConfigFactory.withUplink + pointsAtUplink + helpers, ported
+// faithfully. Every outbound whose socket leaves the device is pointed at the
+// uplink (a protected loopback SOCKS proxy) via sockopt.dialerProxy, following
+// dialerProxy chains to the socket that actually opens. On any shape it cannot
+// safely rewrite, it reports "not applied" (false) so the caller refuses rather
+// than leaks - the same fail-safe direction as the Java original.
+// =============================================================================
+
+// nwayWithUplink parses `json` fresh (so the caller's original is never
+// mutated), rewrites a COPY, and returns (rewrittenJSON, true) on success, or
+// ("", false) when there was nothing to protect or the config could not be
+// safely rewritten.
+func nwayWithUplink(jsonStr string, port int) (string, bool) {
+	if jsonStr == "" || port <= 0 {
+		return "", false
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &cfg); err != nil {
+		return "", false
+	}
+	outs, ok := cfg["outbounds"].([]interface{})
+	if !ok || len(outs) == 0 {
+		return "", false
+	}
+
+	uplinkTag, okTag := nwayFreeTag(outs, nwayTagUplink)
+	if !okTag {
+		return "", false
+	}
+
+	// The uplink goes in BEFORE the loop (a chain end may point at it).
+	// Appended, not inserted: Xray takes the FIRST outbound as the default.
+	outs = append(outs, nwayUplinkOutbound(port, uplinkTag))
+	cfg["outbounds"] = outs
+	byTag := nwayByTag(outs)
+
+	marked := 0
+	for _, o := range outs {
+		out, ok := o.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		proto := nwayStr(out, "protocol")
+		if proto == "blackhole" || proto == "dns" {
+			continue
+		}
+		if nwayDialsOnlyLoopback(out) {
+			continue
+		}
+		end, status := nwayChainEnd(byTag, out, uplinkTag)
+		switch status {
+		case nwayChainUnfollowable:
+			// A tag that is not here, or a loop: Xray could not dial it
+			// either. Leave the config alone (fail-safe).
+			return "", false
+		case nwayChainAtUplink:
+			// Already ends at our uplink (marked a moment ago as another
+			// outbound's chain end).
+			continue
+		default: // nwayChainFound
+			if nwayDialsOnlyLoopback(end) {
+				// Chain hands off to a loopback listener that is not the
+				// uplink; nothing is there. Leave the config alone.
+				return "", false
+			}
+			nwaySetDialer(end, uplinkTag)
+			marked++
+		}
+	}
+	if marked == 0 {
+		return "", false
+	}
+
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// --- small typed-map helpers -------------------------------------------------
+
+func nwayObj(m map[string]interface{}, key string) map[string]interface{} {
+	if v, ok := m[key].(map[string]interface{}); ok {
+		return v
+	}
+	return nil
+}
+
+func nwayArr(m map[string]interface{}, key string) []interface{} {
+	if v, ok := m[key].([]interface{}); ok {
+		return v
+	}
+	return nil
+}
+
+func nwayStr(m map[string]interface{}, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// --- withUplink helpers (mirror XrayConfigFactory) ---------------------------
+
+// nwayIsLoopback mirrors isLoopback().
+func nwayIsLoopback(address string) bool {
+	a := strings.TrimSpace(address)
+	if a == "" {
+		return false
+	}
+	if strings.HasPrefix(a, "[") && strings.HasSuffix(a, "]") {
+		a = a[1 : len(a)-1]
+	}
+	return strings.HasPrefix(a, "127.") ||
+		a == "::1" ||
+		strings.EqualFold(a, "0:0:0:0:0:0:0:1") ||
+		strings.EqualFold(a, "localhost")
+}
+
+// nwayHostOf mirrors hostOf(): the host part of "host:port".
+func nwayHostOf(hostPort string) string {
+	s := strings.TrimSpace(hostPort)
+	if strings.HasPrefix(s, "[") {
+		if close := strings.IndexByte(s, ']'); close > 0 {
+			return s[1:close]
+		}
+		return s
+	}
+	if colon := strings.LastIndexByte(s, ':'); colon > 0 {
+		return s[:colon]
+	}
+	return s
+}
+
+// nwayDialsOnlyLoopback mirrors dialsOnlyLoopback().
+func nwayDialsOnlyLoopback(out map[string]interface{}) bool {
+	settings := nwayObj(out, "settings")
+	if settings == nil {
+		return false
+	}
+	seen := 0
+	if flat := nwayStr(settings, "address"); flat != "" {
+		seen++
+		if !nwayIsLoopback(flat) {
+			return false
+		}
+	}
+	if redirect := nwayStr(settings, "redirect"); redirect != "" {
+		seen++
+		if !nwayIsLoopback(nwayHostOf(redirect)) {
+			return false
+		}
+	}
+	for _, key := range []string{"vnext", "servers"} {
+		list := nwayArr(settings, key)
+		if list == nil {
+			continue
+		}
+		for _, e := range list {
+			entry, ok := e.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			address := nwayStr(entry, "address")
+			if address == "" {
+				continue
+			}
+			seen++
+			if !nwayIsLoopback(address) {
+				return false
+			}
+		}
+	}
+	return seen > 0
+}
+
+// nwayByTag mirrors byTag(): first outbound wins per tag.
+func nwayByTag(outs []interface{}) map[string]map[string]interface{} {
+	m := map[string]map[string]interface{}{}
+	for _, o := range outs {
+		obj, ok := o.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		t := nwayStr(obj, "tag")
+		if t != "" {
+			if _, exists := m[t]; !exists {
+				m[t] = obj
+			}
+		}
+	}
+	return m
+}
+
+// nwayDialerOf mirrors dialerOf().
+func nwayDialerOf(out map[string]interface{}) string {
+	if out == nil {
+		return ""
+	}
+	stream := nwayObj(out, "streamSettings")
+	if stream == nil {
+		return ""
+	}
+	sockopt := nwayObj(stream, "sockopt")
+	if sockopt == nil {
+		return ""
+	}
+	return nwayStr(sockopt, "dialerProxy")
+}
+
+// nwaySetDialer mirrors setDialer().
+func nwaySetDialer(out map[string]interface{}, uplinkTag string) {
+	stream := nwayObj(out, "streamSettings")
+	if stream == nil {
+		stream = map[string]interface{}{}
+		out["streamSettings"] = stream
+	}
+	sockopt := nwayObj(stream, "sockopt")
+	if sockopt == nil {
+		sockopt = map[string]interface{}{}
+		stream["sockopt"] = sockopt
+	}
+	sockopt["dialerProxy"] = uplinkTag
+}
+
+type nwayChainStatus int
+
+const (
+	nwayChainFound        nwayChainStatus = iota // `end` is the real end outbound
+	nwayChainAtUplink                            // chain already ends at our uplink
+	nwayChainUnfollowable                        // missing tag, loop, or too long
+)
+
+// nwayChainEnd mirrors chainEnd(): follow dialerProxy to the outbound that
+// actually opens the socket.
+func nwayChainEnd(byTag map[string]map[string]interface{}, out map[string]interface{}, uplinkTag string) (map[string]interface{}, nwayChainStatus) {
+	at := out
+	seen := map[string]bool{}
+	for hop := 0; hop < nwayMaxChain; hop++ {
+		next := nwayDialerOf(at)
+		if next == "" {
+			return at, nwayChainFound
+		}
+		if next == uplinkTag {
+			return nil, nwayChainAtUplink
+		}
+		if seen[next] {
+			return nil, nwayChainUnfollowable
+		}
+		seen[next] = true
+		to := byTag[next]
+		if to == nil {
+			return nil, nwayChainUnfollowable
+		}
+		at = to
+	}
+	return nil, nwayChainUnfollowable
+}
+
+// nwayFreeTag mirrors freeTag(): a tag like `wanted` that no outbound has.
+func nwayFreeTag(outs []interface{}, wanted string) (string, bool) {
+	for n := 0; n < 64; n++ {
+		candidate := wanted
+		if n != 0 {
+			candidate = fmt.Sprintf("%s-%d", wanted, n)
+		}
+		taken := false
+		for _, o := range outs {
+			obj, ok := o.(map[string]interface{})
+			if ok && nwayStr(obj, "tag") == candidate {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// nwayUplinkOutbound mirrors uplinkOutbound().
+func nwayUplinkOutbound(port int, tag string) map[string]interface{} {
+	return map[string]interface{}{
+		"tag":      tag,
+		"protocol": "socks",
+		"settings": map[string]interface{}{
+			"address": nwayLoopback,
+			"port":    port,
+		},
+	}
 }
