@@ -70,6 +70,7 @@ package libv2ray
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -109,31 +110,22 @@ const (
 	// The core clamps anything smaller up to 10s with a warning.
 	alfaChainProbeInterval = "10s"
 
-	// The connectivity check, and the whole reason the startup window closes.
+	// The connectivity check is OFF by default (see alfaChainConnectivity) because
+	// with it on the failover can break: when the chain dies, a failed probe
+	// makes the core ask whether the network is up, and if that question also
+	// rides the dead chain the real failure is discarded and the chain is never
+	// demoted. Off, every failed probe counts and the balancer falls back to
+	// aether reliably - at the cost of a <=~20s window at connect where the exit
+	// is WARP before the chain engages (aether starts after the core, so the
+	// first probe always fails).
 	//
-	// When a probe through the chain fails, the core asks THIS url whether the
-	// network itself is up (checkConnectivity in app/observatory/burst). If it
-	// cannot be reached either, the probe's result is pushed as 0 and doCheck
-	// drops it - "should not put results when network is down" - so the chain
-	// is not blamed for it.
-	//
-	// That is exactly the first moments of every connection: aether is still
-	// coming up, so a probe through the chain cannot succeed. Without this, the
-	// one failed sample is the only sample and the chain is demoted until the
-	// next probe. With it, the sample is discarded, the chain has NO
-	// observation at all, and the random strategy counts a candidate with no
-	// observation as alive - so the chain is in use from the first connection.
-	//
-	// It is dialled DIRECTLY (newDirectPingClient, a plain http.Client with no
-	// dispatcher), so it leaves the process as an ordinary socket, enters the
-	// tun and comes back round to the apps' inbound. The rule below pins it to
-	// the aether outbound so that it measures "is WARP up", never "is the chain
-	// up" - which is what keeps the failover working: once WARP is up and only
-	// the chain server is dead, this url answers, the failure is real, and the
-	// chain is demoted as it should be.
-	//
-	// A Cloudflare host on purpose: the path to it is WARP, which IS Cloudflare,
-	// so it is the one address that cannot be unreachable while the tunnel is up.
+	// To close that window WITHOUT breaking failover, the backend may turn the
+	// check on by sending chain_probe_connectivity set to an IP reachable
+	// through WARP. alfaConnPinRule then pins it to aether with an "ip" rule, so
+	// it needs no DNS and never rides the chain. A Cloudflare IP is the natural
+	// choice, since the path to it IS WARP. This value is only a documented
+	// example of the idea; it is NOT applied unless the backend sends it, and as
+	// a hostname it would carry the DNS caveat, so prefer an IP.
 	alfaChainConnectivityURL = "http://cp.cloudflare.com/generate_204"
 
 	// How many samples the health record keeps. Small on purpose: one bad round
@@ -260,12 +252,8 @@ func alfaChainRoute(cfg map[string]interface{}, alfa map[string]interface{}) err
 		// backend moves the rule with it. Inserted right here, immediately
 		// above the catch-all, so every rule the scaffold already had keeps
 		// its place and its precedence.
-		if host := alfaHostRule(alfaChainConnectivity(alfa)); host != "" {
-			rules = alfaInsertBefore(rules, i, map[string]interface{}{
-				"inboundTag":  []interface{}{nwaySocksInTag},
-				"domain":      []interface{}{host},
-				"outboundTag": alfaTagAether,
-			})
+		if pin := alfaConnPinRule(alfaChainConnectivity(alfa)); pin != nil {
+			rules = alfaInsertBefore(rules, i, pin)
 			routing["rules"] = rules
 		}
 		break
@@ -323,7 +311,7 @@ func alfaChainObservatory(alfa map[string]interface{}) map[string]interface{} {
 		// A string: the core's duration type refuses a bare number.
 		"timeout": strconv.Itoa(alfaChainLatency(alfa)) + "s",
 	}
-	if conn := alfaChainConnectivity(alfa); conn != "" && alfaHostRule(conn) != "" {
+	if conn := alfaChainConnectivity(alfa); conn != "" && alfaConnHost(conn) != "" {
 		ping["connectivity"] = conn
 	}
 	return map[string]interface{}{
@@ -347,30 +335,61 @@ func alfaChainProbeDestination(alfa map[string]interface{}) string {
 // it restores the stricter behaviour where every failed probe counts, at the
 // cost of the chain being demoted for the first moments of a connection.
 func alfaChainConnectivity(alfa map[string]interface{}) string {
+	// OFF unless the backend explicitly asks for it. Absent means off, empty
+	// means off; only a non-empty value turns the connectivity check on. This
+	// is the safe default: with no connectivity check every failed probe counts,
+	// so a dead chain is always demoted and the balancer falls back to aether.
 	v, ok := alfa["chain_probe_connectivity"]
 	if !ok {
-		return alfaChainConnectivityURL
+		return ""
 	}
 	if s, isStr := v.(string); isStr {
 		return strings.TrimSpace(s)
 	}
-	return alfaChainConnectivityURL
+	return ""
 }
 
-// alfaHostRule turns an address into the routing-rule form that matches only
-// it - "full:host" - or "" when there is no host to match on. A rule built from
-// a guess would send the wrong traffic to aether, so no guessing: a url that
-// does not parse, or has no host, gets no rule.
-func alfaHostRule(address string) string {
+// alfaConnHost extracts the host of the connectivity address - an IP literal or
+// a domain - or "" when the address does not parse or has no host. No guessing:
+// a bad address gets no host, so no rule and no connectivity entry.
+func alfaConnHost(address string) string {
 	u, err := url.Parse(strings.TrimSpace(address))
 	if err != nil {
 		return ""
 	}
-	host := u.Hostname()
+	return strings.ToLower(u.Hostname())
+}
+
+// alfaConnPinRule builds the routing rule that pins the connectivity check to
+// aether so it measures "is WARP up", never "is the chain up". It returns nil
+// when there is no usable host.
+//
+// The host decides the rule's SHAPE, and this is the whole repair:
+//   - an IP literal -> an "ip" rule. No DNS is involved, so the check never
+//     depends on a lookup that would itself ride the (possibly dead) chain.
+//     This is the only form that keeps failover correct while closing the
+//     startup window, so it is the one to use.
+//   - a hostname -> a "domain" rule. The connection is pinned to aether, but the
+//     name still has to be resolved first, and that lookup rides the catch-all
+//     (the chain). So a hostname closes the startup window but makes the
+//     failover depend on the chain being alive to resolve it - the very bug this
+//     file was carrying. Supported for completeness, not recommended; prefer an
+//     IP reachable through WARP.
+func alfaConnPinRule(address string) map[string]interface{} {
+	host := alfaConnHost(address)
 	if host == "" {
-		return ""
+		return nil
 	}
-	return "full:" + strings.ToLower(host)
+	rule := map[string]interface{}{
+		"inboundTag":  []interface{}{nwaySocksInTag},
+		"outboundTag": alfaTagAether,
+	}
+	if net.ParseIP(host) != nil {
+		rule["ip"] = []interface{}{host}
+	} else {
+		rule["domain"] = []interface{}{"full:" + host}
+	}
+	return rule
 }
 
 // alfaChainStr reads a trimmed string field, or "" when it is absent, null or

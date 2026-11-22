@@ -180,10 +180,10 @@ func TestChainOnly(t *testing.T) {
 	if got := nwayStr(ca, "balancerTag"); got != "chain-balancer" {
 		t.Errorf("catch-all balancerTag is %q", got)
 	}
-	// the rules above it are untouched, plus the one connectivity rule
+	// connectivity is OFF by default, so no extra rule is added: the scaffold's 4
 	rules := nwayArr(nwayObj(cfg, "routing"), "rules")
-	if len(rules) != 5 {
-		t.Fatalf("rule count: %d, want 5 (the alfaChainScaffold's 4 plus connectivity)", len(rules))
+	if len(rules) != 4 {
+		t.Fatalf("rule count: %d, want 4 (connectivity off by default adds none)", len(rules))
 	}
 	if nwayStr(rules[0].(map[string]interface{}), "outboundTag") != "exit-node" ||
 		nwayStr(rules[1].(map[string]interface{}), "outboundTag") != "block" ||
@@ -222,6 +222,9 @@ func TestChainOnly(t *testing.T) {
 		t.Errorf("subjectSelector wrong: %v", ss)
 	}
 	ping := nwayObj(obs, "pingConfig")
+	if _, ok := ping["connectivity"]; ok {
+		t.Error("connectivity must be OFF by default (no field) so failover stays reliable")
+	}
 	if nwayStr(ping, "timeout") != "12s" {
 		t.Errorf("timeout should come from chain_server_latency, got %q", nwayStr(ping, "timeout"))
 	}
@@ -448,21 +451,24 @@ func TestNoUplinkInScaffoldIsANoOp(t *testing.T) {
 // ------------------------- the connectivity check that closes the window
 
 func TestConnectivityIsPinnedToAether(t *testing.T) {
-	cfg := alfaChainRun(t, `{"chain_server":`+alfaChainTestList+`}`)
+	// opt in with an IP, the recommended form: pinned to aether by an "ip" rule,
+	// so the check needs no DNS and never rides the chain.
+	blob := `{"chain_server":` + alfaChainTestList + `,"chain_probe_connectivity":"http://1.1.1.1/generate_204"}`
+	cfg := alfaChainRun(t, blob)
 
 	ping := nwayObj(nwayObj(cfg, "burstObservatory"), "pingConfig")
-	if got := nwayStr(ping, "connectivity"); got != "http://cp.cloudflare.com/generate_204" {
+	if got := nwayStr(ping, "connectivity"); got != "http://1.1.1.1/generate_204" {
 		t.Fatalf("connectivity url is %q", got)
 	}
 
 	rules := nwayArr(nwayObj(cfg, "routing"), "rules")
-	connAt, caAt := -1, -1
+	pinAt, caAt := -1, -1
 	for i, r := range rules {
 		rule := r.(map[string]interface{})
-		if doms, ok := rule["domain"].([]interface{}); ok {
-			for _, d := range doms {
-				if d.(string) == "full:cp.cloudflare.com" {
-					connAt = i
+		if ips, ok := rule["ip"].([]interface{}); ok {
+			for _, ip := range ips {
+				if ip.(string) == "1.1.1.1" {
+					pinAt = i
 					if got := nwayStr(rule, "outboundTag"); got != "aether" {
 						t.Errorf("the connectivity check goes to %q, not aether", got)
 					}
@@ -476,19 +482,18 @@ func TestConnectivityIsPinnedToAether(t *testing.T) {
 			caAt = i
 		}
 	}
-	if connAt < 0 {
-		t.Fatal("no rule pins the connectivity check")
+	if pinAt < 0 {
+		t.Fatal("no IP rule pins the connectivity check to aether")
 	}
-	// above the catch-all, or it would ride the chain and the failover would
-	// never fire
-	if connAt > caAt {
-		t.Errorf("connectivity rule at %d is below the catch-all at %d", connAt, caAt)
+	if pinAt > caAt {
+		t.Errorf("connectivity rule at %d is below the catch-all at %d", pinAt, caAt)
 	}
-	// and it must not have displaced the rules that were already there
-	if nwayStr(rules[0].(map[string]interface{}), "outboundTag") != "exit-node" ||
-		nwayStr(rules[1].(map[string]interface{}), "outboundTag") != "block" ||
-		nwayStr(rules[2].(map[string]interface{}), "outboundTag") != "direct" {
-		t.Error("the alfaChainScaffold's own rules moved")
+	// and no DNS-dependent domain rule was used for an IP
+	for _, r := range rules {
+		rule := r.(map[string]interface{})
+		if nwayStr(rule, "outboundTag") == "aether" && rule["domain"] != nil {
+			t.Errorf("an IP connectivity must not produce a domain rule: %v", rule)
+		}
 	}
 }
 
