@@ -212,6 +212,22 @@ func alfaSplice(scaffold string, plain string, enableStats bool) (string, error)
 		}
 	}
 
+	// ---- chain server (field "chain_server") ------------------------------
+	// NEW. The hop that sits AFTER aether, so the address the internet sees is
+	// this server rather than Cloudflare's. Everything it needs - the outbound,
+	// the balancer that falls back to aether, the observatory and the rewritten
+	// catch-all - is in libv2ray_alfa_chain.go. A blob without the field leaves
+	// the scaffold exactly as it was.
+	outs, err := alfaApplyChain(cfg, outs, alfa)
+	if err != nil {
+		return "", err
+	}
+
+	// NEW. The outbounds spliced in above were not in the scaffold when Java
+	// applied the uplink, so they carry no protected egress yet. See
+	// libv2ray_alfa_uplink.go.
+	alfaCarryUplink(outs)
+
 	cfg["outbounds"] = outs
 	nwayApplyStats(cfg, enableStats)
 
